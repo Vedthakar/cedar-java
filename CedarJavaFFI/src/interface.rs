@@ -24,7 +24,7 @@ use cedar_policy::ffi::{
 use cedar_policy::{
     ffi::{is_authorized_json_str, validate_json_str},
     Authorizer, Entities as CedarEntities, EntityUid, ParseErrors, Policy, PolicySet, Request,
-    Schema, SlotId, Template,
+    Schema, SchemaFragment, SlotId, Template,
 };
 use cedar_policy_formatter::{policies_str_to_pretty, Config};
 use dashmap::DashMap;
@@ -700,6 +700,118 @@ fn parse_cedar_schema_internal<'a>(
             Ok(_) => Ok(JValueGen::Object(env.new_string("success")?.into())),
         }
     }
+}
+
+/// Combine schema fragments into one schema, returned in Cedar's JSON schema format
+#[jni_fn("com.cedarpolicy.model.schema.Schema")]
+pub fn fromFragmentsJni<'a>(mut env: JNIEnv<'a>, _: JClass, fragments_jstr: JString<'a>) -> jvalue {
+    match from_fragments_internal(&mut env, fragments_jstr) {
+        Ok(v) => v.as_jni(),
+        Err(e) => jni_failed(&mut env, e.as_ref()),
+    }
+}
+
+fn from_fragments_internal<'a>(
+    env: &mut JNIEnv<'a>,
+    fragments_jstr: JString<'a>,
+) -> Result<JValueOwned<'a>> {
+    if fragments_jstr.is_null() {
+        raise_npe(env)
+    } else {
+        let fragments_jstring = env.get_string(&fragments_jstr)?;
+        let combined = combine_schema_fragments(&String::from(fragments_jstring))?;
+        Ok(JValueGen::Object(env.new_string(combined)?.into()))
+    }
+}
+
+/// `fragments` is a JSON array in which each element is a fragment in the JSON
+/// schema format (an object) or in the Cedar schema format (a string).
+///
+/// The fragments are checked with `Schema::from_schema_fragments`, so conflicts
+/// and undeclared types are reported exactly as Rust reports them. Warnings
+/// from Cedar-format fragments are dropped, as in `Schema.parse`.
+///
+/// The merge below is hand-written because the validated `Schema` cannot be
+/// handed back to Java. Every operation that takes a schema (authorization,
+/// validation, entity validation and `Schema.cache()`) receives one
+/// `cedar_policy::ffi::Schema`, which is a single JSON or Cedar schema, and
+/// `Schema` has no way to serialize itself back to either format. So the
+/// fragments' own JSON is merged namespace by namespace into one JSON schema.
+/// Validation does not depend on how definitions are split across fragments,
+/// so this schema is equivalent to the one `from_schema_fragments` built.
+/// `combine_schema_fragments_round_trips_contents` checks that no definition is
+/// changed or dropped.
+fn combine_schema_fragments(fragments: &str) -> Result<String> {
+    let fragments = serde_json::from_str::<Vec<Value>>(fragments)?
+        .into_iter()
+        .map(|fragment| -> Result<SchemaFragment> {
+            match fragment {
+                Value::String(text) => Ok(SchemaFragment::from_cedarschema_str(&text)?.0),
+                json => Ok(SchemaFragment::from_json_value(json)?),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Schema::from_schema_fragments(fragments.clone())?;
+
+    let mut combined = serde_json::Map::new();
+    for fragment in fragments {
+        let Value::Object(namespaces) = fragment.to_json_value()? else {
+            return Err("schema fragment did not serialize to a JSON object".into());
+        };
+        for (namespace, definition) in namespaces {
+            let Value::Object(definition) = definition else {
+                return Err(format!("namespace `{namespace}` is not a JSON object").into());
+            };
+            let Value::Object(merged) = combined
+                .entry(namespace.clone())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            else {
+                unreachable!("only objects are inserted into `combined`");
+            };
+            merge_namespace_definition(merged, definition, &namespace)?;
+        }
+    }
+    Ok(Value::Object(combined).to_string())
+}
+
+/// Merge the `entityTypes`, `actions`, `commonTypes` and `annotations` of two
+/// definitions of the same namespace. `Schema::from_schema_fragments` has already
+/// rejected duplicate type and action definitions, so the only possible conflict
+/// is two different values for the same namespace annotation.
+fn merge_namespace_definition(
+    merged: &mut serde_json::Map<String, Value>,
+    definition: serde_json::Map<String, Value>,
+    namespace: &str,
+) -> Result<()> {
+    for (key, value) in definition {
+        match (merged.get_mut(&key), value) {
+            (None, value) => {
+                merged.insert(key, value);
+            }
+            (Some(Value::Object(existing)), Value::Object(entries)) => {
+                for (name, entry) in entries {
+                    match existing.get(&name) {
+                        Some(prev) if *prev != entry => {
+                            return Err(format!(
+                                "conflicting values for `{key}.{name}` in namespace `{namespace}`"
+                            )
+                            .into());
+                        }
+                        _ => {
+                            existing.insert(name, entry);
+                        }
+                    }
+                }
+            }
+            (Some(existing), value) if *existing == value => {}
+            (Some(_), _) => {
+                return Err(
+                    format!("conflicting values for `{key}` in namespace `{namespace}`").into(),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[jni_fn("com.cedarpolicy.model.policy.Policy")]
@@ -2219,6 +2331,7 @@ pub(crate) mod jvm_based_tests {
 
         use super::*;
         use cedar_policy::{EntityId, Schema};
+        use serde_json::json;
 
         #[test]
         fn parse_json_schema_internal_valid_test() {
@@ -2342,6 +2455,234 @@ pub(crate) mod jvm_based_tests {
             let mut env = JVM.attach_current_thread().unwrap();
             let null_str = JString::from(JObject::null());
             let result = parse_cedar_schema_internal(&mut env, null_str);
+            assert!(result.is_ok(), "Expected error on null input");
+            assert!(
+                env.exception_check().unwrap(),
+                "Expected Java exception due to a null input"
+            );
+            env.exception_clear().unwrap();
+        }
+        fn combine(fragments: Value) -> Schema {
+            let combined =
+                combine_schema_fragments(&fragments.to_string()).expect("fragments should combine");
+            Schema::from_json_str(&combined).expect("combined schema should parse")
+        }
+
+        #[test]
+        fn combine_schema_fragments_mixed_formats() {
+            // Each fragment refers to types declared in the other one.
+            let schema = combine(json!([
+                {
+                    "App": {
+                        "entityTypes": {
+                            "User": { "memberOfTypes": ["Group"] },
+                            "Group": {}
+                        },
+                        "actions": {}
+                    }
+                },
+                r#"namespace App {
+                    entity Document;
+                    action view appliesTo { principal: [User], resource: [Document] };
+                }"#
+            ]));
+            let entity_types: Vec<String> = schema.entity_types().map(|t| t.to_string()).collect();
+            for expected in ["App::User", "App::Group", "App::Document"] {
+                assert!(
+                    entity_types.contains(&expected.to_string()),
+                    "missing {expected} in {entity_types:?}"
+                );
+            }
+            assert_eq!(
+                schema.actions().map(|a| a.to_string()).collect::<Vec<_>>(),
+                vec![r#"App::Action::"view""#]
+            );
+        }
+
+        #[test]
+        fn combine_schema_fragments_matches_from_schema_fragments() {
+            let fragments = [
+                "entity User; type Name = String;",
+                "namespace Photos { entity Photo = { owner: User, title: Name }; }",
+                "namespace Photos { action view appliesTo { principal: User, resource: Photo }; }",
+            ];
+            let expected = Schema::from_schema_fragments(
+                fragments
+                    .iter()
+                    .map(|f| SchemaFragment::from_cedarschema_str(f).unwrap().0),
+            )
+            .unwrap();
+            let combined = combine(json!(fragments));
+            let names = |s: &Schema| {
+                let mut types: Vec<String> = s.entity_types().map(|t| t.to_string()).collect();
+                types.extend(s.actions().map(|a| a.to_string()));
+                types.sort();
+                types
+            };
+            assert_eq!(names(&combined), names(&expected));
+        }
+
+        #[test]
+        fn combine_schema_fragments_round_trips_contents() {
+            let fragments = [
+                r#"
+                @doc("shared")
+                type Name = String;
+                @doc("a user")
+                entity User in [Team] = { @doc("display name") name: Name, age?: Long };
+                entity Team;
+                action manage;
+                "#,
+                r#"
+                @doc("a document")
+                entity Document = { owner: User, tags: Set<String> } tags String;
+                action view in [manage] appliesTo {
+                    principal: [User],
+                    resource: [Document],
+                    context: { ip: ipaddr }
+                };
+                @doc("view alias") action edit in [view, manage];
+                "#,
+                r#"namespace Photos { entity Photo in [Album]; entity Album; }"#,
+                r#"namespace Photos { action share appliesTo { principal: User, resource: Photo }; }"#,
+            ];
+            let combined: Value = serde_json::from_str(
+                &combine_schema_fragments(&json!(fragments).to_string()).unwrap(),
+            )
+            .unwrap();
+
+            // Every definition of every fragment is in the combined schema,
+            // unchanged, and nothing else is.
+            let mut expected_count = 0;
+            for fragment in fragments {
+                let fragment = SchemaFragment::from_cedarschema_str(fragment)
+                    .unwrap()
+                    .0
+                    .to_json_value()
+                    .unwrap();
+                for (namespace, definition) in fragment.as_object().unwrap() {
+                    for (section, entries) in definition.as_object().unwrap() {
+                        for (name, entry) in entries.as_object().unwrap() {
+                            expected_count += 1;
+                            assert_eq!(
+                                &combined[namespace][section][name], entry,
+                                "{namespace} {section} {name}"
+                            );
+                        }
+                    }
+                }
+            }
+            let combined_count: usize = combined
+                .as_object()
+                .unwrap()
+                .values()
+                .flat_map(|d| d.as_object().unwrap().values())
+                .map(|entries| entries.as_object().unwrap().len())
+                .sum();
+            assert_eq!(combined_count, expected_count);
+
+            // The combined JSON is a valid schema with the cross-fragment
+            // action hierarchy intact.
+            let schema = Schema::from_json_value(combined).unwrap();
+            let edit = EntityUid::from_str(r#"Action::"edit""#).unwrap();
+            let parents: Vec<String> = schema
+                .action_entities()
+                .unwrap()
+                .get(&edit)
+                .unwrap()
+                .clone()
+                .into_inner()
+                .2
+                .iter()
+                .map(|p| p.to_string())
+                .collect();
+            for expected in [r#"Action::"view""#, r#"Action::"manage""#] {
+                assert!(parents.contains(&expected.to_string()), "{parents:?}");
+            }
+        }
+
+        #[test]
+        fn combine_schema_fragments_single_and_empty() {
+            let schema = combine(json!(["entity User;"]));
+            assert_eq!(schema.entity_types().count(), 1);
+            let schema = combine(json!([]));
+            assert_eq!(schema.entity_types().count(), 0);
+        }
+
+        #[test]
+        fn combine_schema_fragments_duplicate_entity_type() {
+            let err = combine_schema_fragments(
+                &json!([
+                    "namespace A { entity User; }",
+                    "namespace A { entity User; }"
+                ])
+                .to_string(),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("A::User"),
+                "unexpected error: {err}"
+            );
+        }
+
+        #[test]
+        fn combine_schema_fragments_undeclared_type() {
+            let err = combine_schema_fragments(
+                &json!(["entity User in [Group];", "entity Admin;"]).to_string(),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("Group"), "unexpected error: {err}");
+        }
+
+        #[test]
+        fn combine_schema_fragments_conflicting_namespace_annotation() {
+            let err = combine_schema_fragments(
+                &json!([
+                    "@team(\"a\") namespace A { entity User; }",
+                    "@team(\"b\") namespace A { entity Group; }"
+                ])
+                .to_string(),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("conflicting values for `annotations.team` in namespace `A`"),
+                "unexpected error: {err}"
+            );
+            // The same annotation on both definitions is not a conflict.
+            combine(json!([
+                "@team(\"a\") namespace A { entity User; }",
+                "@team(\"a\") namespace A { entity Group; }"
+            ]));
+        }
+
+        #[test]
+        fn combine_schema_fragments_invalid_input() {
+            assert!(combine_schema_fragments("not json").is_err());
+            assert!(combine_schema_fragments("{}").is_err());
+            assert!(combine_schema_fragments(r#"["not a schema"]"#).is_err());
+        }
+
+        #[test]
+        fn from_fragments_internal_valid() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            let input = env
+                .new_string(
+                    json!([{ "": { "entityTypes": {}, "actions": {} } }, "entity User;"])
+                        .to_string(),
+                )
+                .unwrap();
+            let result = from_fragments_internal(&mut env, input).unwrap();
+            let jstring = JString::cast(&mut env, result.l().unwrap()).unwrap();
+            let combined = String::from(env.get_string(&jstring).unwrap());
+            assert!(Schema::from_json_str(&combined).is_ok());
+        }
+
+        #[test]
+        fn from_fragments_internal_null() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            let null_str = JString::from(JObject::null());
+            let result = from_fragments_internal(&mut env, null_str);
             assert!(result.is_ok(), "Expected error on null input");
             assert!(
                 env.exception_check().unwrap(),

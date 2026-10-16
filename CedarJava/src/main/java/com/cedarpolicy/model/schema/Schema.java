@@ -16,9 +16,12 @@
 
 package com.cedarpolicy.model.schema;
 
+import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 
+import com.cedarpolicy.CedarJson;
 import com.cedarpolicy.SharedCedarInternals;
 import com.cedarpolicy.loader.LibraryLoader;
 import com.cedarpolicy.model.exception.CacheException;
@@ -129,6 +132,32 @@ public final class Schema {
             return new Schema(JsonOrCedar.Cedar, Optional.empty(), Optional.of(str));
         }
 
+    }
+
+    /**
+     * Combine schema fragments into a single schema, using Cedar's
+     * {@code Schema::from_schema_fragments}. Fragments may mix the JSON and Cedar
+     * formats, may refer to types declared in other fragments, and may each add
+     * declarations to the same namespace.
+     *
+     * @param fragments Schema fragments to combine.
+     * @throws InternalException    If a fragment fails to parse, or the fragments
+     *                              do not form a valid schema (for example, two
+     *                              fragments declare the same entity type).
+     * @throws NullPointerException If the list or any fragment is null.
+     * @return A {@link Schema} in the JSON format that is guaranteed to be valid.
+     */
+    public static Schema fromFragments(List<Schema> fragments) throws InternalException, NullPointerException {
+        Objects.requireNonNull(fragments, "fragments");
+        fragments.forEach(fragment -> Objects.requireNonNull(fragment, "fragment"));
+        final String fragmentsJson;
+        try {
+            fragmentsJson = CedarJson.objectWriter().writeValueAsString(fragments);
+        } catch (JsonProcessingException e) {
+            throw new InternalException("Failed to serialize schema fragments: " + e.getMessage());
+        }
+        String schemaJson = fromFragmentsJni(fragmentsJson);
+        return new Schema(JsonOrCedar.Json, Optional.of(schemaJson), Optional.empty());
     }
 
     /**
@@ -263,6 +292,8 @@ public final class Schema {
     private static native String parseJsonSchemaJni(String schemaJson) throws InternalException, NullPointerException;
 
     private static native String parseCedarSchemaJni(String schemaText) throws InternalException, NullPointerException;
+
+    private static native String fromFragmentsJni(String fragmentsJson) throws InternalException, NullPointerException;
 
     private static native void preparseSchemaJni(String id, String schemaValue, boolean isCedar) throws InternalException;
 
