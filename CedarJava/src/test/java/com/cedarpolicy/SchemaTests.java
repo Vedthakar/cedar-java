@@ -16,21 +16,35 @@
 
 package com.cedarpolicy;
 
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Optional;
 
 import static com.cedarpolicy.TestUtil.loadSchemaResource;
 import static com.cedarpolicy.TestUtil.loadCedarSchemaResource;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
+import com.cedarpolicy.model.AuthorizationRequest;
+import com.cedarpolicy.model.AuthorizationResponse;
+import com.cedarpolicy.model.AuthorizationSuccessResponse.Decision;
+import com.cedarpolicy.model.ValidationRequest;
+import com.cedarpolicy.model.ValidationResponse;
 import com.cedarpolicy.model.exception.InternalException;
+import com.cedarpolicy.model.policy.PolicySet;
 import com.cedarpolicy.model.schema.Schema;
 import com.cedarpolicy.model.schema.Schema.JsonOrCedar;
+import com.cedarpolicy.value.EntityTypeName;
+import com.cedarpolicy.value.EntityUID;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -319,6 +333,122 @@ public class SchemaTests {
             Schema jsonSchemaObj = Schema.parse(JsonOrCedar.Json, jsonEnumSchema);
             String cedarResult = jsonSchemaObj.toCedarFormat();
             assertNotNull(cedarResult, "Cedar conversion result should not be null");
+        }
+    }
+
+    @Nested
+    @DisplayName("fromFragments Tests")
+    class FromFragmentsTests {
+        // Each fragment refers to types declared in the other one.
+        private final Schema usersFragment = new Schema(JsonOrCedar.Json, Optional.of("""
+                {
+                    "App": {
+                        "entityTypes": {
+                            "User": { "memberOfTypes": ["Group"] },
+                            "Group": {}
+                        },
+                        "actions": {}
+                    }
+                }
+                """), Optional.empty());
+        private final Schema documentsFragment = new Schema("""
+                namespace App {
+                    entity Document;
+                    action view appliesTo { principal: [User], resource: [Document] };
+                }
+                """);
+
+        private final AuthorizationEngine engine = new BasicAuthorizationEngine();
+
+        private EntityUID uid(String type, String id) {
+            return new EntityUID(EntityTypeName.parse(type).get(), id);
+        }
+
+        @Test
+        void testCombinesJsonAndCedarFragments() throws Exception {
+            Schema schema = Schema.fromFragments(List.of(usersFragment, documentsFragment));
+
+            assertEquals(JsonOrCedar.Json, schema.type);
+            JsonNode entityTypes = schema.toJsonFormat().get("App").get("entityTypes");
+            assertTrue(entityTypes.has("User"));
+            assertTrue(entityTypes.has("Group"));
+            assertTrue(entityTypes.has("Document"));
+            assertTrue(schema.toJsonFormat().get("App").get("actions").has("view"));
+            assertDoesNotThrow(() -> Schema.parse(JsonOrCedar.Json, schema.schemaJson.get().toString()));
+        }
+
+        @Test
+        void testValidatesPoliciesAgainstCombinedSchema() throws Exception {
+            Schema schema = Schema.fromFragments(List.of(usersFragment, documentsFragment));
+
+            PolicySet valid = PolicySet.parsePolicies(
+                    "permit(principal in App::Group::\"admins\", action == App::Action::\"view\", resource);");
+            ValidationResponse validResponse = engine.validate(new ValidationRequest(schema, valid));
+            assertTrue(validResponse.success.get().validationErrors.isEmpty());
+
+            PolicySet invalid = PolicySet.parsePolicies(
+                    "permit(principal, action == App::Action::\"edit\", resource);");
+            ValidationResponse invalidResponse = engine.validate(new ValidationRequest(schema, invalid));
+            assertFalse(invalidResponse.success.get().validationErrors.isEmpty());
+        }
+
+        @Test
+        void testAuthorizesWithCombinedSchema() throws Exception {
+            Schema schema = Schema.fromFragments(List.of(usersFragment, documentsFragment));
+            PolicySet policies = PolicySet.parsePolicies("permit(principal, action, resource);");
+            AuthorizationRequest request = new AuthorizationRequest(uid("App::User", "alice"),
+                    uid("App::Action", "view"), uid("App::Document", "doc"), Optional.of(new HashMap<>()),
+                    Optional.of(schema), true);
+
+            AuthorizationResponse uncached = engine.isAuthorized(request, policies, new HashSet<>());
+            assertEquals(Decision.Allow, uncached.success.get().getDecision());
+
+            schema.cache();
+            policies.cache();
+            AuthorizationResponse cached = engine.isAuthorized(request, policies, new HashSet<>());
+            assertEquals(Decision.Allow, cached.success.get().getDecision());
+
+            // Request validation uses the combined schema: Group is not a valid principal for view.
+            AuthorizationRequest invalidRequest = new AuthorizationRequest(uid("App::Group", "admins"),
+                    uid("App::Action", "view"), uid("App::Document", "doc"), Optional.of(new HashMap<>()),
+                    Optional.of(schema), true);
+            AuthorizationResponse rejected = engine.isAuthorized(invalidRequest, policies, new HashSet<>());
+            assertTrue(rejected.errors.isPresent());
+        }
+
+        @Test
+        void testSingleAndEmptyFragmentLists() throws Exception {
+            Schema single = Schema.fromFragments(List.of(documentsFragment, new Schema("namespace App { entity User; }")));
+            assertTrue(single.toJsonFormat().get("App").get("entityTypes").has("User"));
+            assertEquals("{}", Schema.fromFragments(List.of()).schemaJson.get().toString());
+        }
+
+        @Test
+        void testDuplicateDeclarationFails() {
+            InternalException e = assertThrows(InternalException.class, () -> Schema.fromFragments(List.of(
+                    new Schema("namespace App { entity User; }"), new Schema("namespace App { entity User; }"))));
+            assertTrue(e.getMessage().contains("App::User"), e.getMessage());
+        }
+
+        @Test
+        void testUndeclaredTypeFails() {
+            // documentsFragment refers to App::User, which only usersFragment declares.
+            InternalException e = assertThrows(InternalException.class,
+                    () -> Schema.fromFragments(List.of(documentsFragment)));
+            assertTrue(e.getMessage().contains("failed to resolve type: User"), e.getMessage());
+        }
+
+        @Test
+        void testMalformedFragmentFails() {
+            assertThrows(InternalException.class,
+                    () -> Schema.fromFragments(List.of(usersFragment, new Schema("not a schema"))));
+        }
+
+        @Test
+        void testNullInputs() {
+            assertThrows(NullPointerException.class, () -> Schema.fromFragments(null));
+            assertThrows(NullPointerException.class,
+                    () -> Schema.fromFragments(Arrays.asList(usersFragment, null)));
         }
     }
 }
